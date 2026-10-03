@@ -1,5 +1,5 @@
 import { Component, ElementRef, Injector, afterNextRender, computed, inject, signal, viewChild } from '@angular/core';
-import { OcrService } from './ocr.service';
+import { OcrMode, OcrService } from './ocr.service';
 
 type CaptureMode = 'auto-crop' | 'manual-crop';
 type FieldKey = 'maxWorkingPressureBar' | 'maxWorkingPressurePsi' | 'containerId' | 'isoCode' | 'approvalCode' | 'applicableRegulations' | 'tankCode' | 'kemlerCode' | 'unNumber' | 'mpgmKg' | 'mpgmLb' | 'tareKg' | 'tareLb' | 'payloadKg' | 'payloadLb' | 'capacityLiters' | 'capacityUsGallons' | 'capacityCubicMeters' | 'capacityCubicFeet';
@@ -164,7 +164,7 @@ export class App {
     }
   };
   private readonly injector = inject(Injector);
-  private readonly ocrService = inject(OcrService);
+  protected readonly ocrService = inject(OcrService);
   private cropStart: { x: number; y: number } | null = null;
   private cropResize: { handle: CropResizeHandle; crop: CropRect } | null = null;
   private imageSelection = 0;
@@ -458,6 +458,11 @@ export class App {
 
   private roundAngle(angle: number): number {
     return Math.round(angle * 10) / 10;
+  }
+
+  protected setOcrMode(mode: OcrMode): void {
+    if (this.processing() || this.applyingCrop()) return;
+    this.ocrService.setMode(mode);
   }
 
   protected async setCaptureMode(mode: CaptureMode): Promise<void> {

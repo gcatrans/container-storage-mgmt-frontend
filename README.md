@@ -22,7 +22,7 @@ The Angular 22 PWA shell supports camera capture, device image selection, automa
 
 Auto mode first scans the full photo to suggest a crop; manual mode waits for a user-selected crop. OCR remains local, while explicitly saved records can be uploaded to the configured remote synchronization endpoint.
 
-Current verification status: `105/105` unit tests passing, a successful production build, and `16/16` Playwright E2E tests passing.
+Current verification status: `111/111` unit tests passing, a successful production build, and `16/16` Playwright E2E tests passing.
 
 ## Camera Alignment
 
@@ -132,6 +132,39 @@ The active browser model bundle comes from the `@gutenye/ocr-models` npm package
 - `/models/ch_PP-OCRv4_rec_infer.onnx`
 - `/models/ppocr_keys_v1.txt`
 
+## OCR Engine Mode (Browser / Server)
+
+A second "OCR:" selector beside the Crop mode selector lets the user choose,
+at any time, between:
+
+- **Navigateur** (default): the on-device pipeline described above.
+- **Serveur**: each OCR pass POSTs its already-cropped/scaled working image to
+  a server-side PaddleOCR API (see the sibling project
+  `container-storage-mgmt-ocr-api`) instead of running inference locally. The
+  response is parsed into the same `{ text, mean, box }` line shape used by
+  the local engine, so structured field extraction, ISO 6346 validation, and
+  diagnostics behave identically regardless of the selected mode.
+
+The selection is persisted in `localStorage` (`ocr-mode`). Selecting
+"Serveur" skips loading the local ONNX models/engine at startup; switching
+back to "Navigateur" (re)initializes them on demand.
+
+The server endpoint is a constant in `ocr.service.ts` (`OCR_SERVER_URL`,
+currently a local-development placeholder) that production deployments must
+replace with the enterprise server's reachable HTTPS endpoint, the same way
+`REMOTE_API_URL` must be replaced for saved-result synchronization.
+
+Known follow-ups (not yet implemented):
+
+- Resizing images client-side before upload in server mode, to cap the data
+  sent over the network. The current `MAX_*_PIXELS` constants already bound
+  what is sent to the *local* engine but are not yet applied as a pre-upload
+  size cap for the server path beyond that.
+- Authentication for server mode: a future version will add Keycloak-based
+  login (OIDC Authorization Code + PKCE) to the PWA, and `OcrService` will
+  attach the resulting access token as `Authorization: Bearer <token>` on
+  requests to `OCR_SERVER_URL`. Today no such header is sent.
+
 ## OCR Recovery
 
 If the image preview fails to load, the application creates a fresh object URL and retries up to two times. After the retry limit is reached, it clears the preview and displays a diagnostic.
@@ -219,6 +252,18 @@ npm run test:e2e
 ```
 
 Use a maximum command timeout of `240000` ms so the Chromium and WebKit suites can complete.
+
+`playwright.config.ts` starts both the Angular dev server and the OCR API
+(`container-storage-mgmt-api-ocr`, via its `docker-compose.e2e.yml`, requires
+Docker) automatically if they are not already running, and reuses them
+instead of restarting if they are (`reuseExistingServer`, disabled in CI). The
+API's `/health` endpoint doubles as its readiness probe, so the first run
+after a fresh checkout or an image change can take a few minutes (Docker
+build + first-time PaddleOCR model download) before tests actually start.
+Note: on Windows, the OCR API container is not reliably stopped when the test
+run ends (a `docker compose up` process-teardown quirk) — stop it manually
+with `docker compose -f container-storage-mgmt-api-ocr/docker-compose.e2e.yml down`
+if you don't want it to keep running between sessions.
 
 ## Relevant Implementation
 

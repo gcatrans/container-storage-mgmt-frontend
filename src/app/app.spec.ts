@@ -31,7 +31,7 @@ describe('App', () => {
 
     expect(photoButtons.map((button) => button.textContent?.trim())).toEqual(['New', 'Existing']);
     expect(compiled.querySelector('.photo-actions > span')?.textContent?.trim()).toBe('Photo:');
-    expect(compiled.querySelector('.capture-controls')?.children).toHaveLength(2);
+    expect(compiled.querySelector('.capture-controls')?.children).toHaveLength(3);
     expect(compiled.querySelector<HTMLSelectElement>('.select-control select')?.value).toBe('auto-crop');
     expect(compiled.querySelector('.empty-preview button')).toBeNull();
     expect(compiled.querySelector('.source-actions')).toBeNull();
@@ -342,7 +342,7 @@ describe('App', () => {
       captureMode: () => string;
     };
     expect(app.captureMode()).toBe('auto-crop');
-    expect((fixture.nativeElement as HTMLElement).querySelectorAll('.select-control')).toHaveLength(1);
+    expect((fixture.nativeElement as HTMLElement).querySelectorAll('.select-control')).toHaveLength(2);
   });
 
   it('should show Photo and Crop controls after selecting an image', () => {
@@ -357,8 +357,9 @@ describe('App', () => {
       fixture.detectChanges();
 
       const controls = Array.from((fixture.nativeElement as HTMLElement).querySelector('.capture-controls')!.children);
-      expect(controls.map((control) => control.className)).toEqual(['photo-actions', 'select-control']);
+      expect(controls.map((control) => control.className)).toEqual(['photo-actions', 'select-control', 'select-control']);
       expect((controls[1].querySelector('select') as HTMLSelectElement).value).toBe('auto-crop');
+      expect((controls[2].querySelector('select') as HTMLSelectElement).value).toBe('browser');
     } finally {
       vi.unstubAllGlobals();
     }

@@ -21,10 +21,22 @@ export default defineConfig({
       use: { ...devices['Desktop Safari'] },
     },
   ],
-  webServer: {
-    command: 'npm run start -- --host 127.0.0.1 --port 4200',
-    url: 'http://127.0.0.1:4200',
-    reuseExistingServer: !process.env.CI,
-    timeout: 180_000,
-  },
+  webServer: [
+    {
+      command: 'npm run start -- --host 127.0.0.1 --port 4200',
+      url: 'http://127.0.0.1:4200',
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+    },
+    {
+      // Starts the OCR server-mode API (see container-storage-mgmt-api-ocr/docker-compose.e2e.yml).
+      // Reuses an already-running instance (e.g. a manually started `ocr-api` container) instead of
+      // starting a second one, same as the Angular dev server above.
+      command: 'docker compose -f container-storage-mgmt-api-ocr/docker-compose.e2e.yml up --build',
+      // /health also triggers the (first-call) model load, so this doubles as the readiness probe.
+      url: 'http://127.0.0.1:8000/health',
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+    },
+  ],
 });

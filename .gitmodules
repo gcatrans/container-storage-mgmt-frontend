@@ -1,0 +1,3 @@
+[submodule "container-storage-mgmt-api-ocr"]
+	path = container-storage-mgmt-api-ocr
+	url = ../container-storage-mgmt-api-ocr
