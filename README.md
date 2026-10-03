@@ -137,8 +137,8 @@ The active browser model bundle comes from the `@gutenye/ocr-models` npm package
 A second "OCR:" selector beside the Crop mode selector lets the user choose,
 at any time, between:
 
-- **Navigateur** (default): the on-device pipeline described above.
-- **Serveur**: each OCR pass POSTs its already-cropped/scaled working image to
+- **Browser** (default): the on-device pipeline described above.
+- **Server**: each OCR pass POSTs its already-cropped/scaled working image to
   a server-side PaddleOCR API (see the sibling project
   `container-storage-mgmt-ocr-api`) instead of running inference locally. The
   response is parsed into the same `{ text, mean, box }` line shape used by
@@ -146,8 +146,8 @@ at any time, between:
   diagnostics behave identically regardless of the selected mode.
 
 The selection is persisted in `localStorage` (`ocr-mode`). Selecting
-"Serveur" skips loading the local ONNX models/engine at startup; switching
-back to "Navigateur" (re)initializes them on demand.
+"Server" skips loading the local ONNX models/engine at startup; switching
+back to "Browser" (re)initializes them on demand.
 
 The server endpoint is a constant in `ocr.service.ts` (`OCR_SERVER_URL`,
 currently a local-development placeholder) that production deployments must

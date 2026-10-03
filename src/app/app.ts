@@ -1237,7 +1237,17 @@ export class App {
       this.checkDigitPreviewUrl.set(pass.url);
       retainPass = true;
         const detected = await this.detectWithTimeout(pass.url);
-       const approvalLine = detected.find((line) => /\b[0-9A-Z]{2}\s*[A-Z]\s*[0-9]\b\s+.+$/.test(line.text));
+       // Server-only: the server engine has been observed dropping the space between the
+       // approval code and the regulations text that follows it (e.g. "58K2RID-ADR-IMDG" instead
+       // of "58K2 RID-ADR-IMDG"). The browser path is untouched (same pattern as before).
+       const isServerCheckDigitScan = this.ocrService.mode() === 'server';
+       const approvalCandidatePattern = isServerCheckDigitScan
+         ? /\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\s*[-:.]?\s*(.+)$/
+         : /\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\b\s+(.+)$/;
+       const approvalLine = detected.find((line) => {
+         const match = line.text.match(approvalCandidatePattern);
+         return Boolean(match && (!isServerCheckDigitScan || /\b(?:RID|ADR|IMDG)\b/.test(match[4])));
+       });
        const approvalMatch = approvalLine?.text.match(/\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\b/);
        if (approvalLine && approvalMatch) {
          const regulations = approvalLine.text.replace(approvalMatch[0], '').replace(/^\s*[-:.]?\s*/, '').trim();
@@ -1570,6 +1580,31 @@ export class App {
   }
 
   private findContainerIdAnchor(lines: OcrLine[]): string {
+    // Server-only: UN tank marking plates, read through the server OCR engine, have occasionally
+    // produced a single detection box covering the container ID that is many times taller than
+    // the page's median line height (observed ~6x on a real photo, vs. ~2x for the tallest
+    // legitimate same-row label) - likely the detector merging in surrounding clutter on a busy
+    // plate. That fails `isLikelySingleOcrRow` outright and blocks anchor detection entirely,
+    // even though the fragment's own text is already a clean, self-contained ID match needing no
+    // stitching with any neighbor. Browser-mode OCR has not shown this failure mode, so this
+    // bypass is scoped to UN tank images in server mode only, rather than loosening the
+    // row-height check globally.
+    // Checked on the space-stripped text, not with a `\bUN\s*TANK\b` word-boundary pattern: the
+    // server engine has read "UN TANK T22" as "UNTANKT22" (no gap at all) on a real photo, which
+    // fails any boundary-anchored match.
+    const isUnTankImage = lines.some((line) => /UNTANK/i.test(line.text.replace(/\s+/g, '')));
+    if (isUnTankImage && this.ocrService.mode() === 'server') {
+      for (const line of lines) {
+        const compact = line.text.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+        const fullMatch = compact.match(/[A-Z]{3}[UJZ]\d{7}/g)?.find((value) => this.validateContainerId(value));
+        if (fullMatch) return fullMatch.slice(0, 10);
+      }
+      for (const line of lines) {
+        const compact = line.text.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+        const partialMatch = compact.match(/^[A-Z]{3}[UJZ]\d{6}$/)?.[0];
+        if (partialMatch) return partialMatch;
+      }
+    }
     const fragments = lines
       .map((line) => ({
         line,
@@ -1727,7 +1762,13 @@ export class App {
       .sort((first, second) => first - second);
     if (!heights.length) return true;
     const medianHeight = heights[Math.floor((heights.length - 1) / 2)];
-    return bounds.bottom - bounds.top <= medianHeight * 1.75;
+    // Server-only: a short fragment's detection box can legitimately run a bit taller relative to
+    // the page's median line height with server-mode PaddleOCR than with the browser engine
+    // (observed splitting a 4-char owner code like "AGZU" into its own slightly-taller box, at
+    // ~1.8x median, instead of merging it with the following digits) without actually spanning
+    // multiple rows. The browser path keeps its original, stricter ratio.
+    const ratio = this.ocrService.mode() === 'server' ? 2.0 : 1.75;
+    return bounds.bottom - bounds.top <= medianHeight * ratio;
   }
 
   private sameOcrRow(first: { bounds: BoxBounds | null }, second: { bounds: BoxBounds | null }): boolean {
@@ -1737,6 +1778,87 @@ export class App {
     const firstCenter = (first.bounds.top + first.bounds.bottom) / 2;
     const secondCenter = (second.bounds.top + second.bounds.bottom) / 2;
     return Math.abs(firstCenter - secondCenter) <= Math.min(firstHeight, secondHeight) * 0.5;
+  }
+
+  // Server-only (see call site in extractFields): merges OCR fragments that sit on the same
+  // visual row into one combined line, before any field-specific parsing runs. The server engine
+  // (PaddleOCR) splits a label and its value into separate detection boxes where the browser's
+  // ONNX pipeline keeps them as one line, and draws disproportionately tall boxes for short label
+  // words - which breaks both same-line regexes (label and value no longer share one string) and
+  // center-based "is this line above or below the label" comparisons (a tall label box's center
+  // drifts toward the next row). Vertical overlap between boxes, not their center distance, is
+  // used here specifically because it stays reliable even when one box is abnormally tall.
+  private mergeLinesByRow(lines: OcrLine[]): OcrLine[] {
+    const entries = lines.map((line, index) => ({ line, index, bounds: this.boxBounds(line.box) }));
+    const parent = entries.map((entry) => entry.index);
+    const find = (index: number): number => {
+      while (parent[index] !== index) {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+      }
+      return index;
+    };
+    const union = (first: number, second: number) => {
+      const firstRoot = find(first);
+      const secondRoot = find(second);
+      if (firstRoot !== secondRoot) parent[firstRoot] = secondRoot;
+    };
+    // Two boxes belong to the same visual row only if ALL of these hold:
+    // - they overlap vertically (plain overlap ratio alone is NOT reliable: a genuine label+value
+    //   split can measure as low as ~0.5-0.6 while two distinct-but-tightly-spaced rows in dense
+    //   tank-marking layouts can measure ~0.4-0.46 on a real image - there is no safe cutoff
+    //   between those two using this signal alone);
+    // - they do NOT overlap horizontally (real label+value fragments sit side by side, left to
+    //   right; two different rows that happen to be tall and close together instead share the
+    //   same left margin/column and overlap heavily in x);
+    // - the horizontal gap between them is small relative to their height (a few character
+    //   widths, like a real label-to-value gap). Without this, a cluttered/noisy photo (lots of
+    //   small, scattered misread fragments from background text/other plates) chains fragments
+    //   transitively across the ENTIRE image into one giant merged line, since "no x overlap +
+    //   some y overlap" alone has no sense of distance - observed on a real UN-tank photo.
+    const sameRow = (first: BoxBounds, second: BoxBounds): boolean => {
+      const verticalOverlap = Math.min(first.bottom, second.bottom) - Math.max(first.top, second.top);
+      const minHeight = Math.min(first.bottom - first.top, second.bottom - second.top);
+      const verticallyAligned = minHeight > 0 && verticalOverlap / minHeight >= 0.3;
+      const horizontalOverlap = Math.min(first.right, second.right) - Math.max(first.left, second.left);
+      const maxHeight = Math.max(first.bottom - first.top, second.bottom - second.top);
+      const closeEnough = horizontalOverlap <= 0 && -horizontalOverlap <= maxHeight * 5;
+      return verticallyAligned && closeEnough;
+    };
+    for (let first = 0; first < entries.length; first++) {
+      if (!entries[first].bounds) continue;
+      for (let second = first + 1; second < entries.length; second++) {
+        if (!entries[second].bounds) continue;
+        if (sameRow(entries[first].bounds!, entries[second].bounds!)) {
+          union(first, second);
+        }
+      }
+    }
+    const groups = new Map<number, typeof entries>();
+    for (const entry of entries) {
+      const root = find(entry.index);
+      const group = groups.get(root);
+      if (group) group.push(entry);
+      else groups.set(root, [entry]);
+    }
+    const merged = [...groups.values()].map((group) => {
+      if (group.length === 1) return group[0].line;
+      const sorted = [...group].sort((first, second) => (first.bounds?.left ?? 0) - (second.bounds?.left ?? 0));
+      const bounds = this.combineBounds(sorted.map((entry) => entry.bounds).filter((bounds): bounds is BoxBounds => Boolean(bounds)));
+      const box = bounds
+        ? [[bounds.left, bounds.top], [bounds.right, bounds.top], [bounds.right, bounds.bottom], [bounds.left, bounds.bottom]]
+        : sorted[0].line.box;
+      return {
+        text: sorted.map((entry) => entry.line.text).join(' '),
+        mean: sorted.reduce((sum, entry) => sum + entry.line.mean, 0) / sorted.length,
+        box,
+      };
+    });
+    return merged.sort((first, second) => {
+      const firstBounds = this.boxBounds(first.box);
+      const secondBounds = this.boxBounds(second.box);
+      return (firstBounds?.top ?? 0) - (secondBounds?.top ?? 0) || (firstBounds?.left ?? 0) - (secondBounds?.left ?? 0);
+    });
   }
 
 
@@ -1855,7 +1977,11 @@ export class App {
     });
   }
 
-  private extractFields(lines: OcrLine[]): Record<FieldKey, ContainerField> {
+  private extractFields(rawLines: OcrLine[]): Record<FieldKey, ContainerField> {
+    const isServerMode = this.ocrService.mode() === 'server';
+    // Server-only: merges same-row OCR fragments before any parsing below runs (see
+    // mergeLinesByRow). The browser path is untouched - same raw lines as before.
+    const lines = isServerMode ? this.mergeLinesByRow(rawLines) : rawLines;
     const fields: Record<FieldKey, ContainerField> = {
       maxWorkingPressureBar: { value: '', unit: 'BAR' }, maxWorkingPressurePsi: { value: '', unit: 'PSI' },
       containerId: { value: '' }, isoCode: { value: '' },
@@ -1909,7 +2035,11 @@ export class App {
         }
       }
     }
-    const unTankIndex = text.findIndex((line) => /\bUN\s*TANK\b/.test(line.normalized));
+    // Server-only: a strict `\bUN\s*TANK\b` misses "UNTANKT22" (no gap at all, read that way by
+    // the server engine on a real photo). The browser path keeps the original, stricter pattern.
+    const unTankIndex = isServerMode
+      ? text.findIndex((line) => /UNTANK/i.test(line.normalized.replace(/\s+/g, '')))
+      : text.findIndex((line) => /\bUN\s*TANK\b/.test(line.normalized));
     const isoLine = unTankIndex < 0 ? find(/\b[0-9]{2}[A-Z][0-9A-Z]\b/) : undefined;
     if (isoLine) {
       fields.isoCode = { value: isoLine.normalized.match(/\b[0-9]{2}[A-Z][0-9A-Z]\b/)![0], confidence: isoLine.mean };
@@ -1918,8 +2048,21 @@ export class App {
     if (unTankIndex >= 0) {
       const tankLine = text[unTankIndex];
       const tankRemainder = tankLine.normalized.split(/\bUN\s*TANK\b/)[1]?.replace(/^\s*[:.-]?\s*/, '').trim() ?? '';
-      const approvalLine = text.find((line) => /\b[0-9A-Z]{2}\s*[A-Z]\s*[0-9]\b\s+.+$/.test(line.normalized));
-      const approvalMatch = approvalLine?.normalized.match(/\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\b\s+(.+)$/);
+      // Server-only: the gap between the approval code and the regulations text that follows it
+      // (e.g. "58K2 RID-ADR-IMDG") has been observed missing in the server engine's output (e.g.
+      // "58K2RID-ADR-IMDG") on the same physical plate. `\s*[-:.]?\s*` accepts both, but is loose
+      // enough on its own to also match short unrelated noise fragments - requiring a known
+      // UN-tank regulation code right after is what actually distinguishes a genuine
+      // approval-code line from that noise. The browser path keeps the original, stricter pattern.
+      const approvalPattern = isServerMode
+        ? /\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\s*[-:.]?\s*(.+)$/
+        : /\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\b\s+(.+)$/;
+      const isApprovalLine = (line: { normalized: string }) => {
+        const match = line.normalized.match(approvalPattern);
+        return Boolean(match && (!isServerMode || /\b(?:RID|ADR|IMDG)\b/.test(match[4])));
+      };
+      const approvalLine = text.find((line) => isApprovalLine(line));
+      const approvalMatch = approvalLine?.normalized.match(approvalPattern);
       const regulationsValue = approvalMatch?.[4].replace(/^APPLICABLE\s+REGULATIONS\s*:?-?\s*/i, '').trim() ?? '';
       const tankCodeText = tankRemainder
         .replace(approvalMatch?.[0] ?? '', '')
@@ -1942,8 +2085,30 @@ export class App {
         const match = parseTankWeight(line);
         return match ? [match] : [];
       });
-      const gross = tankWeightRows[0];
-      const tare = tankWeightRows[1];
+      // Server-only: prefer the row's own label over raw position. Pure `[0]`/`[1]` indexing
+      // breaks whenever only one of the two rows gets detected/read at all (observed on a real
+      // server-mode scan: the gross-weight line was missing from both OCR passes entirely,
+      // leaving a single row that then got wrongly attributed to "gross" by sitting at index 0 -
+      // showing the tare reading as the gross weight instead of leaving gross blank). "RE WEIGHT"
+      // (not just "TARE") is also accepted: the server engine has read "TARE WEIGHT" with the
+      // leading "TA" missing on a real photo. The browser path keeps the original indexing.
+      let gross: (typeof tankWeightRows)[number] | undefined;
+      let tare: (typeof tankWeightRows)[number] | undefined;
+      if (isServerMode) {
+        const classifyTankWeightRow = (row: (typeof tankWeightRows)[number]): 'gross' | 'tare' | undefined => {
+          if (/GROSS/.test(row.line.normalized)) return 'gross';
+          if (/\bTARE\b|\bRE\s*WEIGHT\b/.test(row.line.normalized)) return 'tare';
+          return undefined;
+        };
+        const explicitGross = tankWeightRows.find((row) => classifyTankWeightRow(row) === 'gross');
+        const explicitTare = tankWeightRows.find((row) => classifyTankWeightRow(row) === 'tare');
+        const unclassifiedWeightRows = tankWeightRows.filter((row) => row !== explicitGross && row !== explicitTare);
+        gross = explicitGross ?? (explicitTare ? undefined : unclassifiedWeightRows[0]);
+        tare = explicitTare ?? (explicitGross ? unclassifiedWeightRows[0] : unclassifiedWeightRows[1]);
+      } else {
+        gross = tankWeightRows[0];
+        tare = tankWeightRows[1];
+      }
       const capacityPattern = /(\d[\d ,.]*?)\s*L\b[^\d]*(\d[\d ,.]*?)\s*US\s*GAL\b/;
       let capacityIndex = -1;
       let capacityEndIndex = -1;
