@@ -29,12 +29,20 @@ export default defineConfig({
       timeout: 180_000,
     },
     {
-      // Starts the OCR server-mode API (see container-storage-mgmt-api-ocr/docker-compose.e2e.yml).
+      // Starts the PaddleOCR server-mode API (see container-storage-mgmt-api-ocr-python/docker-compose.e2e.yml).
       // Reuses an already-running instance (e.g. a manually started `ocr-api` container) instead of
       // starting a second one, same as the Angular dev server above.
-      command: 'docker compose -f container-storage-mgmt-api-ocr/docker-compose.e2e.yml up --build',
+      command: 'docker compose -f container-storage-mgmt-api-ocr-python/docker-compose.e2e.yml up --build',
       // /health also triggers the (first-call) model load, so this doubles as the readiness probe.
       url: 'http://127.0.0.1:8000/health',
+      reuseExistingServer: !process.env.CI,
+      timeout: 180_000,
+    },
+    {
+      // Starts the Node/onnxruntime-node OCR API (see
+      // container-storage-mgmt-api-ocr-node/docker-compose.e2e.yml). Same reuse behavior as above.
+      command: 'docker compose -f container-storage-mgmt-api-ocr-node/docker-compose.e2e.yml up --build',
+      url: 'http://127.0.0.1:8100/health',
       reuseExistingServer: !process.env.CI,
       timeout: 180_000,
     },

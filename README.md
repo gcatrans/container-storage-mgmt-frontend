@@ -134,36 +134,135 @@ The active browser model bundle comes from the `@gutenye/ocr-models` npm package
 
 ## OCR Engine Mode (Browser / Server)
 
-A second "OCR:" selector beside the Crop mode selector lets the user choose,
-at any time, between:
+This is a prototype: the goal is to let users directly compare accuracy and
+response time across every OCR engine available, not just pick one and
+forget the others. A second "OCR:" selector beside the Crop mode selector
+lets the user choose, at any time, between four engines:
 
-- **Browser** (default): the on-device pipeline described above.
-- **Server**: each OCR pass POSTs its already-cropped/scaled working image to
-  a server-side PaddleOCR API (see the sibling project
-  `container-storage-mgmt-ocr-api`) instead of running inference locally. The
-  response is parsed into the same `{ text, mean, box }` line shape used by
-  the local engine, so structured field extraction, ISO 6346 validation, and
-  diagnostics behave identically regardless of the selected mode.
+- **Browser (local)** (default): the on-device ONNX pipeline described
+  above (`@gutenye/ocr-browser` + `onnxruntime-web`, single WASM thread).
+- **Server - PaddleOCR (fast)**: POSTs the already-cropped/scaled working
+  image to the Python PaddleOCR API (sibling project/submodule
+  `container-storage-mgmt-api-ocr-python`, port `8000`), using its speed-optimized
+  "fast" model profile (`PP-OCRv4_mobile`).
+- **Server - PaddleOCR (accurate)**: same API, port, and protocol as above,
+  but requests the accuracy-optimized "accurate" model profile
+  (`PP-OCRv4_server`) via an extra `profile=accurate` form field. Not
+  benchmarked yet - this mode exists specifically so it can be evaluated.
+- **Server - Local OCR (Node)**: POSTs to a second sibling
+  project/submodule, `container-storage-mgmt-api-ocr-node` (port `8100`),
+  which runs the *exact same* ONNX models and decode pipeline as "Browser"
+  (`@gutenye/ocr-common`, pinned to the same version) but via
+  `onnxruntime-node` on a server instead of `onnxruntime-web` in the
+  browser - i.e. the same engine, freed from the browser's single-thread
+  WASM limit.
 
-The selection is persisted in `localStorage` (`ocr-mode`). Selecting
-"Server" skips loading the local ONNX models/engine at startup; switching
-back to "Browser" (re)initializes them on demand.
+All four return the same `{ text, mean, box }` line shape, so structured
+field extraction, ISO 6346 validation, and diagnostics behave identically
+regardless of the selected mode - except for a handful of PaddleOCR-specific
+workarounds in `app.ts` (gated on `OcrService.isPaddleOcrEngine()`, true for
+the two PaddleOCR modes only) that compensate for box-splitting/text quirks
+specific to that engine family; "Browser" and "Server - Local OCR (Node)"
+share the same gutenye-engine code path and need no such workarounds.
 
-The server endpoint is a constant in `ocr.service.ts` (`OCR_SERVER_URL`,
-currently a local-development placeholder) that production deployments must
-replace with the enterprise server's reachable HTTPS endpoint, the same way
-`REMOTE_API_URL` must be replaced for saved-result synchronization.
+The selection is persisted in `localStorage` (`ocr-mode`). Selecting any
+"Server - ..." mode skips loading the local ONNX models/engine at startup;
+switching back to "Browser" (re)initializes them on demand. Response time
+for the currently selected engine is already visible without any extra
+instrumentation: the existing status message and "Raw detected text"
+diagnostics panel report per-pass and total elapsed milliseconds for every
+mode.
+
+Changing the OCR mode while a photo is already loaded re-runs analysis on
+that same photo immediately (no need to re-select it via "Existing"): in
+auto-crop mode, the full automatic-crop detection pass restarts from
+scratch; in manual-crop mode, the previously-applied crop region is
+re-scanned with the new engine (nothing happens yet if no crop has been
+applied). Covered by `e2e/ocr-mode-switch.spec.ts`.
+
+The server host defaults to the page's own location
+(`window.location.hostname`) in `ocr.service.ts`, so this works whether the
+PWA is opened as `localhost`, a LAN IP, or a real hostname (e.g. a tablet
+reaching a dev machine over the network) without a rebuild - only the ports
+(`8000` / `8100`) are hardcoded. If an API is ever reverse-proxied under a
+different host/path, update `ocr.service.ts`'s `SERVER_ENGINES` accordingly.
+
+An **"API host"** text field at the top of the page overrides this default
+(`OcrService.setApiHost`, persisted in `localStorage` as `ocr-api-host`).
+This matters because camera access (`getUserMedia`) requires a secure
+context (HTTPS, or `localhost`): a tablet may need to reach the PWA itself
+over HTTPS (e.g. the deployed `gcatrans.github.io` URL, for camera access)
+while the OCR APIs run on a different, HTTP-only dev machine on the local
+network - two hosts that no longer match. The field accepts a bare
+hostname/IP, a `host:port` pair, or a full URL; only the hostname is kept,
+since each engine already has a fixed port. Clearing it falls back to the
+page-hostname default. Note this does not bypass the browser's mixed-content
+blocking: an HTTPS page still cannot call an HTTP-only API host directly.
+
+Until the OCR APIs have a stable, HTTPS-reachable address, the field
+pre-fills with a temporary prototype default (`192.168.1.96`, the current
+LAN-only dev machine - see `DEFAULT_API_HOST` in `ocr.service.ts`) rather
+than an empty value, since the app is published on GitHub Pages (HTTPS)
+while the APIs are not.
 
 Known follow-ups (not yet implemented):
 
-- Resizing images client-side before upload in server mode, to cap the data
-  sent over the network. The current `MAX_*_PIXELS` constants already bound
-  what is sent to the *local* engine but are not yet applied as a pre-upload
-  size cap for the server path beyond that.
-- Authentication for server mode: a future version will add Keycloak-based
+- Resizing images client-side before upload in any server mode, to cap the
+  data sent over the network. The current `MAX_*_PIXELS` constants already
+  bound what is sent to the *local* engine but are not yet applied as a
+  pre-upload size cap for the server paths beyond each API's own
+  `OCR_API_MAX_IMAGE_BYTES` safety net.
+- Authentication for server modes: a future version will add Keycloak-based
   login (OIDC Authorization Code + PKCE) to the PWA, and `OcrService` will
   attach the resulting access token as `Authorization: Bearer <token>` on
-  requests to `OCR_SERVER_URL`. Today no such header is sent.
+  requests to both APIs. Today no such header is sent.
+- `e2e/container-id.spec.ts` checks, for all four engines against all eight
+  reference photos, that the container ID (including its check digit) is
+  read in full and directly by the OCR - not inferred/computed, and no
+  other field. It also logs each case's end-to-end elapsed time
+  (file-selected to OCR-done) to the console as `[timing] mode=... file=...
+  elapsedMs=...`, captured before the correctness assertions so it is
+  recorded even for a failing case.
+
+  Latest full real run (2026-10-04, chromium, full `npx playwright test`
+  suite, 49 tests / 7.4 min total): **40/49 passed**. Result by engine,
+  with average elapsed ms across the 8 reference photos:
+
+  | Engine | Pass rate | Avg elapsed ms |
+  | --- | --- | --- |
+  | Browser (local) | 8/8 | ~3046 |
+  | Server - PaddleOCR (fast) | 7/8 | ~4058 |
+  | Server - PaddleOCR (accurate) | 4/8 | ~13876 |
+  | Server - Local OCR (Node) | 8/8 | ~2686 |
+
+  Server - Local OCR (Node) is the fastest engine overall (even slightly
+  ahead of Browser); Server - PaddleOCR (accurate) is 3-5x slower than
+  every other engine *and* fails half the photos - strictly worse than
+  "fast" on this reference set, not just a slower/more-accurate trade-off.
+
+  Failures: Server - PaddleOCR (fast) fails only `un-tank_small.jpg` (check
+  digit inferred/computed instead of read directly). Server - PaddleOCR
+  (accurate) fails `general-purpose_20ft_frontal.jpg` and all three
+  UN-tank-plate photos - no container ID line detected at all, not a
+  wrong-value mismatch. The PaddleOCR-specific UN-tank workarounds in
+  `app.ts` (`isPaddleOcrEngine()`-gated) were tuned against the
+  "fast"/mobile model's specific output quirks; the "accurate"/server
+  model likely has different quirks that need their own investigation -
+  not yet done.
+
+  Broader field coverage (not just the container ID) is still
+  "Browser"/"Server - PaddleOCR (fast)" only, in
+  `e2e/container-markings.spec.ts` / `container-markings-server.spec.ts`.
+  The same real run: `container-markings.spec.ts` (Browser) 8/8 passed;
+  `container-markings-server.spec.ts` (Server - PaddleOCR fast) **4/8
+  failed** - on photos where the container ID itself reads correctly, so
+  these are separate, more granular field-extraction gaps: an unexpected
+  extra "2x automatic crop" retry pass on
+  `general-purpose_20ft_frontal.jpg`; a missing `TANK CODE` field on
+  `un-tank_3.JPG`; an `APPLICABLE REGULATIONS` value polluted with
+  merged-in text from other plate lines on `un-tank_2.JPG`; and a missing
+  `MAX WORKING PRESSURE` field on `un-tank_small.jpg`. Not yet
+  investigated.
 
 ## OCR Recovery
 
@@ -254,7 +353,7 @@ npm run test:e2e
 Use a maximum command timeout of `240000` ms so the Chromium and WebKit suites can complete.
 
 `playwright.config.ts` starts both the Angular dev server and the OCR API
-(`container-storage-mgmt-api-ocr`, via its `docker-compose.e2e.yml`, requires
+(`container-storage-mgmt-api-ocr-python`, via its `docker-compose.e2e.yml`, requires
 Docker) automatically if they are not already running, and reuses them
 instead of restarting if they are (`reuseExistingServer`, disabled in CI). The
 API's `/health` endpoint doubles as its readiness probe, so the first run
@@ -262,7 +361,7 @@ after a fresh checkout or an image change can take a few minutes (Docker
 build + first-time PaddleOCR model download) before tests actually start.
 Note: on Windows, the OCR API container is not reliably stopped when the test
 run ends (a `docker compose up` process-teardown quirk) — stop it manually
-with `docker compose -f container-storage-mgmt-api-ocr/docker-compose.e2e.yml down`
+with `docker compose -f container-storage-mgmt-api-ocr-python/docker-compose.e2e.yml down`
 if you don't want it to keep running between sessions.
 
 ## Relevant Implementation

@@ -1,3 +1,6 @@
-[submodule "container-storage-mgmt-api-ocr"]
-	path = container-storage-mgmt-api-ocr
-	url = ../container-storage-mgmt-api-ocr
+[submodule "container-storage-mgmt-api-ocr-python"]
+	path = container-storage-mgmt-api-ocr-python
+	url = ../container-storage-mgmt-api-ocr-python
+[submodule "container-storage-mgmt-api-ocr-node"]
+	path = container-storage-mgmt-api-ocr-node
+	url = ../container-storage-mgmt-api-ocr-node
