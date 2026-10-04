@@ -3,6 +3,7 @@ import { App } from './app';
 
 describe('App', () => {
   beforeEach(async () => {
+    localStorage.clear();
     await TestBed.configureTestingModule({
       imports: [App],
     }).compileComponents();
@@ -35,6 +36,35 @@ describe('App', () => {
     expect(compiled.querySelector<HTMLSelectElement>('.select-control select')?.value).toBe('auto-crop');
     expect(compiled.querySelector('.empty-preview button')).toBeNull();
     expect(compiled.querySelector('.source-actions')).toBeNull();
+  });
+
+  it('should render an API host override field at the top of the page', () => {
+    const fixture = TestBed.createComponent(App);
+    fixture.detectChanges();
+
+    const compiled = fixture.nativeElement as HTMLElement;
+    const main = compiled.querySelector('main');
+    const hostInput = compiled.querySelector<HTMLInputElement>('.api-host-config input[type="text"]');
+
+    expect(main?.firstElementChild?.contains(hostInput)).toBe(true);
+    expect(hostInput?.value).toBe('192.168.1.96');
+    expect(hostInput?.placeholder).toBe('Same host as this page');
+  });
+
+  it('should forward API host field changes to the OCR service', () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      ocrService: { setApiHost: ReturnType<typeof vi.fn> };
+    };
+    const setApiHost = vi.spyOn(app.ocrService, 'setApiHost');
+    fixture.detectChanges();
+
+    const compiled = fixture.nativeElement as HTMLElement;
+    const hostInput = compiled.querySelector<HTMLInputElement>('.api-host-config input[type="text"]')!;
+    hostInput.value = '192.168.1.42';
+    hostInput.dispatchEvent(new Event('change'));
+
+    expect(setApiHost).toHaveBeenCalledWith('192.168.1.42');
   });
 
   it('should leave the results data area empty before analysis', () => {
@@ -342,7 +372,7 @@ describe('App', () => {
       captureMode: () => string;
     };
     expect(app.captureMode()).toBe('auto-crop');
-    expect((fixture.nativeElement as HTMLElement).querySelectorAll('.select-control')).toHaveLength(2);
+    expect((fixture.nativeElement as HTMLElement).querySelectorAll('.select-control')).toHaveLength(3);
   });
 
   it('should show Photo and Crop controls after selecting an image', () => {
@@ -475,6 +505,173 @@ describe('App', () => {
 
     expect(app.scanAutoCrop).toHaveBeenNthCalledWith(1, preview, 4_000_000);
     expect(app.scanAutoCrop).toHaveBeenNthCalledWith(2, preview, 1_000_000);
+  });
+
+  it('should retry the enlarged automatic crop at a reduced size after an out-of-memory-looking failure', async () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      imageSelection: number;
+      waitForPreviewImage: ReturnType<typeof vi.fn>;
+      scanAutoCrop: ReturnType<typeof vi.fn>;
+      extractFields: ReturnType<typeof vi.fn>;
+      hasLowConfidenceForAutomaticCrop: ReturnType<typeof vi.fn>;
+      lowConfidenceSummary: ReturnType<typeof vi.fn>;
+      createSuggestedCrop: ReturnType<typeof vi.fn>;
+      applyAutomaticCropRetry: ReturnType<typeof vi.fn>;
+      prepareInitialCrop(image: Blob, selection: number): Promise<void>;
+      diagnostics: () => Array<{ message: string }>;
+    };
+    const preview = { naturalWidth: 1920, naturalHeight: 1080 } as HTMLImageElement;
+    app.imageSelection = 1;
+    app.waitForPreviewImage = vi.fn().mockResolvedValue(preview);
+    app.scanAutoCrop = vi.fn().mockResolvedValue([{ text: 'CSQU 305438 3', mean: 0.5, box: [[0, 0]] }]);
+    app.extractFields = vi.fn().mockReturnValue({ containerId: { value: '' } });
+    app.hasLowConfidenceForAutomaticCrop = vi.fn().mockReturnValue(true);
+    app.lowConfidenceSummary = vi.fn().mockReturnValue('Container ID');
+    app.createSuggestedCrop = vi.fn().mockResolvedValue({ x: 0, y: 0, width: 1, height: 1 });
+    app.applyAutomaticCropRetry = vi.fn()
+      .mockRejectedValueOnce(new Error('out of memory allocating canvas'))
+      .mockResolvedValueOnce({ lines: [{ text: 'CSQU3054383', mean: 0.9, box: [[0, 0]] }], fields: { containerId: { value: 'CSQU3054383' } }, suggestedCrop: null });
+
+    await app.prepareInitialCrop(new Blob(['image'], { type: 'image/jpeg' }), 1);
+
+    expect(app.applyAutomaticCropRetry).toHaveBeenCalledTimes(2);
+    expect(app.applyAutomaticCropRetry.mock.calls[0][2]).toBe(4_000_000);
+    expect(app.applyAutomaticCropRetry.mock.calls[0][3]).toBe('2x automatic crop');
+    expect(app.applyAutomaticCropRetry.mock.calls[1][2]).toBe(1_000_000);
+    expect(app.applyAutomaticCropRetry.mock.calls[1][3]).toBe('2x automatic crop (reduced)');
+    expect(app.diagnostics().some((diagnostic) => diagnostic.message.includes('could not be scanned'))).toBe(false);
+  });
+
+  it('should report the failure directly, without a reduced-size retry, for a non-memory-looking error', async () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      imageSelection: number;
+      waitForPreviewImage: ReturnType<typeof vi.fn>;
+      scanAutoCrop: ReturnType<typeof vi.fn>;
+      extractFields: ReturnType<typeof vi.fn>;
+      hasLowConfidenceForAutomaticCrop: ReturnType<typeof vi.fn>;
+      lowConfidenceSummary: ReturnType<typeof vi.fn>;
+      createSuggestedCrop: ReturnType<typeof vi.fn>;
+      applyAutomaticCropRetry: ReturnType<typeof vi.fn>;
+      prepareInitialCrop(image: Blob, selection: number): Promise<void>;
+      diagnostics: () => Array<{ message: string }>;
+    };
+    const preview = { naturalWidth: 1920, naturalHeight: 1080 } as HTMLImageElement;
+    app.imageSelection = 1;
+    app.waitForPreviewImage = vi.fn().mockResolvedValue(preview);
+    app.scanAutoCrop = vi.fn().mockResolvedValue([{ text: 'CSQU 305438 3', mean: 0.5, box: [[0, 0]] }]);
+    app.extractFields = vi.fn().mockReturnValue({ containerId: { value: '' } });
+    app.hasLowConfidenceForAutomaticCrop = vi.fn().mockReturnValue(true);
+    app.lowConfidenceSummary = vi.fn().mockReturnValue('Container ID');
+    app.createSuggestedCrop = vi.fn().mockResolvedValue({ x: 0, y: 0, width: 1, height: 1 });
+    app.applyAutomaticCropRetry = vi.fn().mockRejectedValueOnce(new Error('network request failed'));
+
+    await app.prepareInitialCrop(new Blob(['image'], { type: 'image/jpeg' }), 1);
+
+    expect(app.applyAutomaticCropRetry).toHaveBeenCalledTimes(1);
+    expect(app.diagnostics().some((diagnostic) => diagnostic.message === 'The enlarged automatic crop could not be scanned.')).toBe(true);
+  });
+
+  it('should re-run automatic analysis on the loaded photo when the OCR mode changes', () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      imageBlob: { set: (value: Blob | null) => void };
+      captureMode: { set: (value: string) => void };
+      ocrService: { mode: () => string; setMode: ReturnType<typeof vi.fn> };
+      prepareInitialCrop: ReturnType<typeof vi.fn>;
+      setOcrMode(mode: string): void;
+    };
+    const image = new Blob(['image'], { type: 'image/jpeg' });
+    app.imageBlob.set(image);
+    app.captureMode.set('auto-crop');
+    const setMode = vi.spyOn(app.ocrService, 'setMode');
+    app.prepareInitialCrop = vi.fn().mockResolvedValue(undefined);
+
+    app.setOcrMode('server-fast');
+
+    expect(setMode).toHaveBeenCalledWith('server-fast');
+    expect(app.prepareInitialCrop).toHaveBeenCalledWith(image, expect.any(Number));
+  });
+
+  it('should not re-run analysis when the OCR mode changes with no photo loaded', () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      prepareInitialCrop: ReturnType<typeof vi.fn>;
+      processImage: ReturnType<typeof vi.fn>;
+      setOcrMode(mode: string): void;
+    };
+    app.prepareInitialCrop = vi.fn();
+    app.processImage = vi.fn();
+
+    app.setOcrMode('server-fast');
+
+    expect(app.prepareInitialCrop).not.toHaveBeenCalled();
+    expect(app.processImage).not.toHaveBeenCalled();
+  });
+
+  it('should do nothing when the OCR mode is set to its current value', () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      imageBlob: { set: (value: Blob | null) => void };
+      ocrService: { mode: () => string; setMode: ReturnType<typeof vi.fn> };
+      prepareInitialCrop: ReturnType<typeof vi.fn>;
+      setOcrMode(mode: string): void;
+    };
+    app.imageBlob.set(new Blob(['image'], { type: 'image/jpeg' }));
+    app.prepareInitialCrop = vi.fn();
+    const setMode = vi.spyOn(app.ocrService, 'setMode');
+
+    app.setOcrMode(app.ocrService.mode());
+
+    expect(setMode).not.toHaveBeenCalled();
+    expect(app.prepareInitialCrop).not.toHaveBeenCalled();
+  });
+
+  it('should re-scan the previously-applied manual crop when the OCR mode changes', () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      imageBlob: { set: (value: Blob | null) => void };
+      captureMode: { set: (value: string) => void };
+      cropRect: { set: (value: { x: number; y: number; width: number; height: number } | null) => void };
+      ocrService: { setMode: ReturnType<typeof vi.fn> };
+      prepareInitialCrop: ReturnType<typeof vi.fn>;
+      processImage: ReturnType<typeof vi.fn>;
+      setOcrMode(mode: string): void;
+    };
+    app.imageBlob.set(new Blob(['image'], { type: 'image/jpeg' }));
+    app.captureMode.set('manual-crop');
+    app.cropRect.set({ x: 0.1, y: 0.1, width: 0.5, height: 0.5 });
+    app.prepareInitialCrop = vi.fn();
+    app.processImage = vi.fn().mockResolvedValue(undefined);
+
+    app.setOcrMode('server-fast');
+
+    expect(app.processImage).toHaveBeenCalledTimes(1);
+    expect(app.prepareInitialCrop).not.toHaveBeenCalled();
+  });
+
+  it('should not scan anything in manual-crop mode when no crop has been applied yet', () => {
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance as unknown as {
+      imageBlob: { set: (value: Blob | null) => void };
+      captureMode: { set: (value: string) => void };
+      ocrService: { setMode: ReturnType<typeof vi.fn> };
+      prepareInitialCrop: ReturnType<typeof vi.fn>;
+      processImage: ReturnType<typeof vi.fn>;
+      setOcrMode(mode: string): void;
+    };
+    app.imageBlob.set(new Blob(['image'], { type: 'image/jpeg' }));
+    app.captureMode.set('manual-crop');
+    const setMode = vi.spyOn(app.ocrService, 'setMode');
+    app.prepareInitialCrop = vi.fn();
+    app.processImage = vi.fn();
+
+    app.setOcrMode('server-fast');
+
+    expect(setMode).toHaveBeenCalledWith('server-fast');
+    expect(app.processImage).not.toHaveBeenCalled();
+    expect(app.prepareInitialCrop).not.toHaveBeenCalled();
   });
 
   it('should create an automatic pass from the loaded preview instead of decoding the source blob', async () => {

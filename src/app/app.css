@@ -215,13 +215,17 @@ video {
   font: 700 0.72rem/1 Arial, sans-serif;
   padding: 2px 3px 0;
 }
-.select-control select {
+.select-control select,
+.select-control input[type='text'] {
   background: #173321;
   border: 1px solid #799f80;
   border-radius: 4px;
   color: #eaf0eb;
   font: 700 0.72rem/1 Arial, sans-serif;
   padding: 6px 22px 6px 8px;
+}
+.api-host-config {
+  margin: 0 0 13px;
 }
 .camera-frame {
   background: #050805;

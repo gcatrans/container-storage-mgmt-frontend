@@ -460,9 +460,29 @@ export class App {
     return Math.round(angle * 10) / 10;
   }
 
+  protected setApiHost(host: string): void {
+    this.ocrService.setApiHost(host);
+  }
+
   protected setOcrMode(mode: OcrMode): void {
     if (this.processing() || this.applyingCrop()) return;
+    if (this.ocrService.mode() === mode) return;
     this.ocrService.setMode(mode);
+
+    const image = this.imageBlob();
+    if (!image) return;
+    if (this.captureMode() === 'auto-crop') {
+      // Re-run the same automatic analysis the initial "New"/"Existing" selection triggered, so
+      // switching engines doesn't require re-selecting the same photo to see its result.
+      this.clearFields();
+      this.cropRect.set(null);
+      this.cropDraft.set(DEFAULT_CROP);
+      void this.prepareInitialCrop(image, this.imageSelection);
+    } else if (this.cropRect()) {
+      // Manual-crop mode: only re-scan if a crop region was already applied once - there's
+      // nothing to (re)analyze yet if the user hasn't drawn/applied one.
+      void this.processImage();
+    }
   }
 
   protected async setCaptureMode(mode: CaptureMode): Promise<void> {
@@ -999,33 +1019,45 @@ export class App {
        let automaticRetryReason = '';
        const shouldRetryAutomaticCrop = Boolean(suggestedCrop && this.hasLowConfidenceForAutomaticCrop(fields));
          if (suggestedCrop && shouldRetryAutomaticCrop) {
+           const retryCrop = suggestedCrop;
+           const sourceSize = { width: preview.naturalWidth, height: preview.naturalHeight };
+           automaticRetryReason = this.lowConfidenceSummary(fields);
+           this.status.set(`Low confidence detected in ${automaticRetryReason}. Retrying the automatic crop at 2x to improve recognition...`);
            try {
-             const retryStartedAt = performance.now();
-             automaticRetryReason = this.lowConfidenceSummary(fields);
-            this.status.set(`Low confidence detected in ${automaticRetryReason}. Retrying the automatic crop at 2x to improve recognition...`);
-            const retryLines = await this.scanCropRegion(image, suggestedCrop, 2, MAX_MANUAL_RETRY_CROP_PIXELS);
-            this.rawScans.update((scans) => [...scans, {
-              label: '2x automatic crop',
-              lines: retryLines.map((line) => ({ text: line.text, confidence: Math.round(line.mean * 100) })),
-              durationMs: Math.round(performance.now() - retryStartedAt),
-              pixelCount: this.lastCropPassPixelCount,
-            }]);
-           lines = this.selectBestOcrLines([lines, retryLines]);
-           this.rawText.set(lines.map((line) => `${line.text} (${Math.round(line.mean * 100)}%)`));
-           fields = this.mergeFieldsByConfidence(fields, this.extractFields(retryLines));
-            this.fields.set(fields);
-             suggestedCrop = await this.createSuggestedCrop(lines, fields.containerId.value || partialContainerId, image, {
-               width: preview.naturalWidth,
-               height: preview.naturalHeight,
-             });
+             const retryResult = await this.applyAutomaticCropRetry(image, retryCrop, MAX_MANUAL_RETRY_CROP_PIXELS, '2x automatic crop', lines, fields, partialContainerId, sourceSize);
+             lines = retryResult.lines;
+             fields = retryResult.fields;
+             suggestedCrop = retryResult.suggestedCrop;
            } catch (error: unknown) {
-            this.addDiagnostic('Automatic crop retry', 'The enlarged automatic crop could not be scanned.', this.errorMessage(error), {
-              crop: suggestedCrop ?? undefined,
-              pass: '2x automatic crop',
-              pixelCount: MAX_MANUAL_RETRY_CROP_PIXELS,
-              scale: 2,
-            }, 'OCR_PASS_FAILED');
-          }
+             if (this.isLikelyMemoryPressureError(error)) {
+               // The browser's WASM OCR memory only ever grows for the page's lifetime (see
+               // isLikelyMemoryPressureError) - on a memory-limited device, enough prior scans in
+               // this session can make this specific pass (the single largest allocation in the
+               // pipeline) the first to fail. Retrying once at a smaller pixel budget needs less
+               // additional memory and still usually improves on the non-retried result.
+               try {
+                 this.status.set(`Low confidence detected in ${automaticRetryReason}. The enlarged retry ran low on memory; retrying at a reduced size...`);
+                 const reducedResult = await this.applyAutomaticCropRetry(image, retryCrop, MAX_AUTO_CROP_FALLBACK_PIXELS, '2x automatic crop (reduced)', lines, fields, partialContainerId, sourceSize);
+                 lines = reducedResult.lines;
+                 fields = reducedResult.fields;
+                 suggestedCrop = reducedResult.suggestedCrop;
+               } catch (reducedError: unknown) {
+                 this.addDiagnostic('Automatic crop retry', 'The enlarged automatic crop could not be scanned, even at a reduced size.', this.errorMessage(reducedError), {
+                   crop: retryCrop,
+                   pass: '2x automatic crop (reduced)',
+                   pixelCount: MAX_AUTO_CROP_FALLBACK_PIXELS,
+                   scale: 2,
+                 }, 'OCR_PASS_FAILED');
+               }
+             } else {
+               this.addDiagnostic('Automatic crop retry', 'The enlarged automatic crop could not be scanned.', this.errorMessage(error), {
+                 crop: retryCrop,
+                 pass: '2x automatic crop',
+                 pixelCount: MAX_MANUAL_RETRY_CROP_PIXELS,
+                 scale: 2,
+               }, 'OCR_PASS_FAILED');
+             }
+           }
         }
         if (partialContainerId && !this.validateContainerId(fields.containerId.value) && suggestedCrop) {
           this.fields.set(fields);
@@ -1148,6 +1180,32 @@ export class App {
     return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
   }
 
+  private async applyAutomaticCropRetry(
+    image: Blob,
+    crop: CropRect,
+    maximumPixels: number,
+    label: string,
+    lines: OcrLine[],
+    fields: Record<FieldKey, ContainerField>,
+    partialContainerId: string,
+    sourceSize: { width: number; height: number },
+  ): Promise<{ lines: OcrLine[]; fields: Record<FieldKey, ContainerField>; suggestedCrop: CropRect | null }> {
+    const retryStartedAt = performance.now();
+    const retryLines = await this.scanCropRegion(image, crop, 2, maximumPixels);
+    this.rawScans.update((scans) => [...scans, {
+      label,
+      lines: retryLines.map((line) => ({ text: line.text, confidence: Math.round(line.mean * 100) })),
+      durationMs: Math.round(performance.now() - retryStartedAt),
+      pixelCount: this.lastCropPassPixelCount,
+    }]);
+    const mergedLines = this.selectBestOcrLines([lines, retryLines]);
+    this.rawText.set(mergedLines.map((line) => `${line.text} (${Math.round(line.mean * 100)}%)`));
+    const mergedFields = this.mergeFieldsByConfidence(fields, this.extractFields(retryLines));
+    this.fields.set(mergedFields);
+    const suggestedCrop = await this.createSuggestedCrop(mergedLines, mergedFields.containerId.value || partialContainerId, image, sourceSize);
+    return { lines: mergedLines, fields: mergedFields, suggestedCrop };
+  }
+
   private async scanCropRegion(image: Blob, crop: CropRect, scale: number, maximumPixels: number): Promise<OcrLine[]> {
     const pass = await this.createCropPass(image, crop, scale, undefined, maximumPixels);
     this.lastCropPassPixelCount = pass.pixelCount;
@@ -1161,9 +1219,18 @@ export class App {
     }
   }
 
+  // The local ONNX runtime's WASM memory only ever grows for the lifetime of the page (standard
+  // WebAssembly behavior, no public API to reclaim it short of a full reload) - on memory-limited
+  // devices (e.g. a low-RAM Android tablet), repeated scans across several photos in the same
+  // session can accumulate enough WASM heap growth that a later, larger pass fails. These
+  // signatures (a RangeError, or an error message naming memory/allocation/canvas/bitmap/webgl)
+  // are how that failure mode tends to surface from canvas/ImageBitmap/ONNX calls.
+  private isLikelyMemoryPressureError(error: unknown): boolean {
+    return error instanceof RangeError || /memory|allocate|canvas|bitmap|decoded image|webgl/i.test(this.errorMessage(error).toLowerCase());
+  }
+
   private ocrFailureMessage(error: unknown): string {
-    const message = this.errorMessage(error).toLowerCase();
-    if (error instanceof RangeError || /memory|allocate|canvas|bitmap|decoded image|webgl/i.test(message)) {
+    if (this.isLikelyMemoryPressureError(error)) {
       return 'The browser ran out of memory while preparing this image for OCR. Try a tighter crop or a smaller photo.';
     }
     return 'Local OCR could not process this image.';
@@ -1237,10 +1304,11 @@ export class App {
       this.checkDigitPreviewUrl.set(pass.url);
       retainPass = true;
         const detected = await this.detectWithTimeout(pass.url);
-       // Server-only: the server engine has been observed dropping the space between the
+       // PaddleOCR-only: the PaddleOCR engines have been observed dropping the space between the
        // approval code and the regulations text that follows it (e.g. "58K2RID-ADR-IMDG" instead
-       // of "58K2 RID-ADR-IMDG"). The browser path is untouched (same pattern as before).
-       const isServerCheckDigitScan = this.ocrService.mode() === 'server';
+       // of "58K2 RID-ADR-IMDG"). The browser and server-node paths (same gutenye decode pipeline)
+       // are untouched (same pattern as before).
+       const isServerCheckDigitScan = this.ocrService.isPaddleOcrEngine();
        const approvalCandidatePattern = isServerCheckDigitScan
          ? /\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\s*[-:.]?\s*(.+)$/
          : /\b([0-9A-Z]{2})\s*([A-Z])\s*([0-9])\b\s+(.+)$/;
@@ -1580,20 +1648,20 @@ export class App {
   }
 
   private findContainerIdAnchor(lines: OcrLine[]): string {
-    // Server-only: UN tank marking plates, read through the server OCR engine, have occasionally
+    // PaddleOCR-only: UN tank marking plates, read through a PaddleOCR engine, have occasionally
     // produced a single detection box covering the container ID that is many times taller than
     // the page's median line height (observed ~6x on a real photo, vs. ~2x for the tallest
     // legitimate same-row label) - likely the detector merging in surrounding clutter on a busy
     // plate. That fails `isLikelySingleOcrRow` outright and blocks anchor detection entirely,
     // even though the fragment's own text is already a clean, self-contained ID match needing no
-    // stitching with any neighbor. Browser-mode OCR has not shown this failure mode, so this
-    // bypass is scoped to UN tank images in server mode only, rather than loosening the
-    // row-height check globally.
-    // Checked on the space-stripped text, not with a `\bUN\s*TANK\b` word-boundary pattern: the
-    // server engine has read "UN TANK T22" as "UNTANKT22" (no gap at all) on a real photo, which
+    // stitching with any neighbor. The browser and server-node engines have not shown this
+    // failure mode, so this bypass is scoped to UN tank images on a PaddleOCR engine only, rather
+    // than loosening the row-height check globally.
+    // Checked on the space-stripped text, not with a `\bUN\s*TANK\b` word-boundary pattern:
+    // PaddleOCR has read "UN TANK T22" as "UNTANKT22" (no gap at all) on a real photo, which
     // fails any boundary-anchored match.
     const isUnTankImage = lines.some((line) => /UNTANK/i.test(line.text.replace(/\s+/g, '')));
-    if (isUnTankImage && this.ocrService.mode() === 'server') {
+    if (isUnTankImage && this.ocrService.isPaddleOcrEngine()) {
       for (const line of lines) {
         const compact = line.text.replace(/[^A-Z0-9]/gi, '').toUpperCase();
         const fullMatch = compact.match(/[A-Z]{3}[UJZ]\d{7}/g)?.find((value) => this.validateContainerId(value));
@@ -1762,12 +1830,13 @@ export class App {
       .sort((first, second) => first - second);
     if (!heights.length) return true;
     const medianHeight = heights[Math.floor((heights.length - 1) / 2)];
-    // Server-only: a short fragment's detection box can legitimately run a bit taller relative to
-    // the page's median line height with server-mode PaddleOCR than with the browser engine
-    // (observed splitting a 4-char owner code like "AGZU" into its own slightly-taller box, at
-    // ~1.8x median, instead of merging it with the following digits) without actually spanning
-    // multiple rows. The browser path keeps its original, stricter ratio.
-    const ratio = this.ocrService.mode() === 'server' ? 2.0 : 1.75;
+    // PaddleOCR-only: a short fragment's detection box can legitimately run a bit taller relative
+    // to the page's median line height with PaddleOCR than with the gutenye engine (browser /
+    // server-node) (observed splitting a 4-char owner code like "AGZU" into its own
+    // slightly-taller box, at ~1.8x median, instead of merging it with the following digits)
+    // without actually spanning multiple rows. The gutenye-engine path keeps its original,
+    // stricter ratio.
+    const ratio = this.ocrService.isPaddleOcrEngine() ? 2.0 : 1.75;
     return bounds.bottom - bounds.top <= medianHeight * ratio;
   }
 
@@ -1978,9 +2047,9 @@ export class App {
   }
 
   private extractFields(rawLines: OcrLine[]): Record<FieldKey, ContainerField> {
-    const isServerMode = this.ocrService.mode() === 'server';
-    // Server-only: merges same-row OCR fragments before any parsing below runs (see
-    // mergeLinesByRow). The browser path is untouched - same raw lines as before.
+    const isServerMode = this.ocrService.isPaddleOcrEngine();
+    // PaddleOCR-only: merges same-row OCR fragments before any parsing below runs (see
+    // mergeLinesByRow). The browser and server-node paths are untouched - same raw lines as before.
     const lines = isServerMode ? this.mergeLinesByRow(rawLines) : rawLines;
     const fields: Record<FieldKey, ContainerField> = {
       maxWorkingPressureBar: { value: '', unit: 'BAR' }, maxWorkingPressurePsi: { value: '', unit: 'PSI' },

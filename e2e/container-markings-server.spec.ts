@@ -2,7 +2,7 @@ import { expect, test, type Locator, type Page } from '@playwright/test';
 import path from 'node:path';
 
 async function useServerOcr(page: Page): Promise<void> {
-  await page.locator('select').filter({ has: page.locator('option[value="server"]') }).selectOption('server');
+  await page.locator('select').filter({ has: page.locator('option[value="server-fast"]') }).selectOption('server-fast');
 }
 
 async function expectContainerId(row: Locator, expected: string): Promise<void> {
